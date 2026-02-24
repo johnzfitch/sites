@@ -1,0 +1,17 @@
+# Binary
+sites
+*.exe
+
+# Config (contains real domains/repos/keys)
+sites.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

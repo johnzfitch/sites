@@ -1,0 +1,21 @@
+[global]
+root = "/var/lib/sites"
+caddyfile = "/etc/caddy/sites.conf"
+log = "/var/lib/sites/deploy.log"
+
+[sites.example-com]
+domain = "example.com"
+repo = "https://github.com/user/example.com"
+branch = "main"
+
+[sites.blog-example-com]
+domain = "blog.example.com"
+repo = "https://github.com/user/blog"
+branch = "main"
+
+# [sites.staging-example-com]
+# domain = "staging.example.com"
+# repo = "https://github.com/user/staging"
+# branch = "main"
+# path = "dist"           # serve a subdirectory
+# deploy_key = "deploy-key/staging-example-com"  # dota secret for private repos

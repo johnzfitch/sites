@@ -1,0 +1,39 @@
+[Unit]
+Description=sites reconciler daemon
+After=network-online.target caddy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sites watch
+Restart=always
+RestartSec=10s
+
+# Run as dedicated user
+User=sites
+Group=sites
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sites /etc/caddy/sites.conf
+
+# Kernel
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+
+# Process
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+
+# Network (needs outbound for git fetch)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Capabilities
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
