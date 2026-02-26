@@ -69,6 +69,9 @@ var configPath = "/etc/sites/sites.toml"
 // domainRe validates domain names: labels separated by dots, no path traversal.
 var domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`)
 
+// branchRe validates git branch names to prevent injection
+var branchRe = regexp.MustCompile(`^[a-zA-Z0-9/_.-]+$`)
+
 func init() {
 	if p := os.Getenv("SITES_CONFIG"); p != "" {
 		configPath = p
@@ -248,6 +251,156 @@ func effectiveRepo(site *SiteConfig) string {
 		return repoToSSH(site.Repo)
 	}
 	return site.Repo
+}
+
+// --- Auto-detection helpers ---
+
+// extractOwnerRepo normalizes a GitHub repo URL to "owner/repo" format.
+func extractOwnerRepo(repo string) string {
+	repo = strings.TrimPrefix(repo, "https://github.com/")
+	repo = strings.TrimPrefix(repo, "http://github.com/")
+	repo = strings.TrimPrefix(repo, "git@github.com:")
+	repo = strings.TrimSuffix(repo, ".git")
+	return repo
+}
+
+// checkRepoVisibility uses gh CLI to detect if repo is public or private.
+// Returns "public", "private", or "unknown" if gh is not available or fails.
+func checkRepoVisibility(repo string) string {
+	ownerRepo := extractOwnerRepo(repo)
+	cmd := exec.Command("gh", "api", fmt.Sprintf("repos/%s", ownerRepo), "--jq", ".visibility")
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	visibility := strings.TrimSpace(string(out))
+	if visibility == "private" {
+		return "private"
+	}
+	return "public"
+}
+
+// canAutoSetup checks if gh CLI and dota are available for auto-setup.
+func canAutoSetup() (ghOK, dotaOK bool) {
+	// Check gh CLI with repo scope
+	if out, err := exec.Command("gh", "auth", "status").CombinedOutput(); err == nil {
+		ghOK = strings.Contains(string(out), "Logged in") ||
+			strings.Contains(string(out), "repo") ||
+			strings.Contains(string(out), "admin:public_key")
+	}
+
+	// Check dota available
+	if _, err := exec.Command("dota", "list").CombinedOutput(); err == nil {
+		dotaOK = true
+	}
+
+	return ghOK, dotaOK
+}
+
+// generateDeployKey creates an ed25519 key, stores in dota, returns public key.
+// If key already exists, returns empty pubKey and the existing secret name.
+func generateDeployKey(domain string) (pubKey string, secretName string, err error) {
+	secretName = "deploy-key/" + strings.ReplaceAll(domain, ".", "-")
+
+	// Check if already exists
+	if _, err := dotaGet(secretName); err == nil {
+		// Key exists - retrieve it and extract public key
+		return "", secretName, nil
+	}
+
+	// Generate to tmpfs
+	kd := tmpfsKeyDir()
+	if err := os.MkdirAll(kd, 0700); err != nil {
+		return "", "", fmt.Errorf("mkdir: %w", err)
+	}
+	var rndBytes [8]byte
+	rand.Read(rndBytes[:])
+	keyPath := filepath.Join(kd, hex.EncodeToString(rndBytes[:]))
+	defer os.Remove(keyPath)
+	defer os.Remove(keyPath + ".pub")
+
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-f", keyPath,
+		"-N", "", "-C", "sites-"+domain)
+	if err := cmd.Run(); err != nil {
+		return "", "", fmt.Errorf("ssh-keygen: %w", err)
+	}
+
+	privKey, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read key: %w", err)
+	}
+	pubKeyBytes, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return "", "", fmt.Errorf("read pubkey: %w", err)
+	}
+
+	// Store in dota
+	cmd = exec.Command("dota", "set", secretName)
+	cmd.Stdin = strings.NewReader(string(privKey))
+	if err := cmd.Run(); err != nil {
+		return "", "", fmt.Errorf("dota set: %w", err)
+	}
+
+	return strings.TrimSpace(string(pubKeyBytes)), secretName, nil
+}
+
+// addGitHubDeployKey registers a public key with a GitHub repo.
+func addGitHubDeployKey(ownerRepo, pubKey, title string) error {
+	cmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/keys", ownerRepo),
+		"--method", "POST",
+		"-f", fmt.Sprintf("title=%s", title),
+		"-f", fmt.Sprintf("key=%s", pubKey),
+		"-F", "read_only=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(out))
+	}
+	return nil
+}
+
+// generateWebhookSecret creates a random secret, stores in dota.
+// If secret already exists, returns the existing value.
+func generateWebhookSecret(domain string) (secret string, secretName string, err error) {
+	secretName = "webhook/" + strings.ReplaceAll(domain, ".", "-")
+
+	// Check if already exists
+	if existing, err := dotaGet(secretName); err == nil {
+		return existing, secretName, nil
+	}
+
+	// Generate 32 bytes of randomness
+	var buf [32]byte
+	rand.Read(buf[:])
+	secret = hex.EncodeToString(buf[:])
+
+	// Store in dota
+	cmd := exec.Command("dota", "set", secretName)
+	cmd.Stdin = strings.NewReader(secret)
+	if err := cmd.Run(); err != nil {
+		return "", "", fmt.Errorf("dota set: %w", err)
+	}
+
+	return secret, secretName, nil
+}
+
+// createGitHubWebhook registers a webhook with a GitHub repo.
+func createGitHubWebhook(ownerRepo, webhookURL, secret string) error {
+	cmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/hooks", ownerRepo),
+		"--method", "POST",
+		"-f", "name=web",
+		"-F", "active=true",
+		"-f", fmt.Sprintf("config[url]=%s", webhookURL),
+		"-f", "config[content_type]=json",
+		"-f", fmt.Sprintf("config[secret]=%s", secret),
+		"-f", "config[insecure_ssl]=0",
+		"-f", "events[]=push")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(out))
+	}
+	return nil
 }
 
 // --- Git operations ---
@@ -605,6 +758,22 @@ func cmdAdd(args []string) {
 		}
 	}
 
+	// Security: validate path to prevent traversal attacks
+	if path != "" {
+		clean := filepath.Clean(path)
+		if strings.Contains(clean, "..") || filepath.IsAbs(clean) {
+			fmt.Fprintf(os.Stderr, "error: path cannot contain .. or be absolute\n")
+			os.Exit(1)
+		}
+		path = clean
+	}
+
+	// Security: validate branch name
+	if !branchRe.MatchString(branch) {
+		fmt.Fprintf(os.Stderr, "error: invalid branch name %q\n", branch)
+		os.Exit(1)
+	}
+
 	// Derive a safe name from domain
 	name := strings.ReplaceAll(domain, ".", "-")
 
@@ -628,13 +797,76 @@ func cmdAdd(args []string) {
 		cfg.Sites = make(map[string]*SiteConfig)
 	}
 
+	// --- Auto-detection flow ---
+	ownerRepo := extractOwnerRepo(repo)
+	webhookSecret := ""
+
+	// Check if auto-setup is possible
+	ghOK, dotaOK := canAutoSetup()
+
+	if ghOK && dotaOK && deployKey == "" {
+		// Auto-detect repo visibility
+		visibility := checkRepoVisibility(repo)
+		fmt.Fprintf(os.Stderr, "  repo: %s (%s)\n", ownerRepo, visibility)
+
+		if visibility == "private" {
+			// Generate and register deploy key
+			fmt.Fprintf(os.Stderr, "  generating deploy key...\n")
+			pubKey, keyName, err := generateDeployKey(domain)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  warn: could not generate deploy key: %v\n", err)
+			} else {
+				deployKey = keyName
+				if pubKey != "" {
+					// New key generated, register with GitHub
+					fmt.Fprintf(os.Stderr, "  registering deploy key with GitHub...\n")
+					if err := addGitHubDeployKey(ownerRepo, pubKey, "sites-"+domain); err != nil {
+						fmt.Fprintf(os.Stderr, "  warn: could not add deploy key: %v\n", err)
+						fmt.Fprintf(os.Stderr, "  add manually: %s\n", pubKey)
+					} else {
+						fmt.Fprintf(os.Stderr, "  deploy key registered\n")
+					}
+				}
+			}
+		}
+
+		// Generate and register webhook (for both public and private)
+		fmt.Fprintf(os.Stderr, "  setting up webhook...\n")
+		webhookURL := fmt.Sprintf("https://%s/.sites/webhook", domain)
+		secret, secretName, err := generateWebhookSecret(domain)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warn: webhook secret generation failed: %v\n", err)
+		} else {
+			webhookSecret = secretName
+			if err := createGitHubWebhook(ownerRepo, webhookURL, secret); err != nil {
+				// Check if it's a duplicate webhook error (422)
+				if strings.Contains(err.Error(), "422") && strings.Contains(err.Error(), "Hook already exists") {
+					fmt.Fprintf(os.Stderr, "  webhook already exists\n")
+				} else {
+					fmt.Fprintf(os.Stderr, "  warn: could not create GitHub webhook: %v\n", err)
+					fmt.Fprintf(os.Stderr, "  configure manually: %s with secret from dota\n", webhookURL)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "  webhook registered\n")
+			}
+		}
+	} else if !ghOK || !dotaOK {
+		if !ghOK {
+			fmt.Fprintf(os.Stderr, "  note: gh CLI not available, skipping auto-setup\n")
+		}
+		if !dotaOK {
+			fmt.Fprintf(os.Stderr, "  note: dota not initialized, skipping auto-setup\n")
+		}
+	}
+
 	cfg.Sites[name] = &SiteConfig{
-		Domain:    domain,
-		Repo:      repo,
-		Branch:    branch,
-		Path:      path,
-		DeployKey: deployKey,
-		NoCaddy:   noCaddy,
+		Domain:        domain,
+		Repo:          repo,
+		Branch:        branch,
+		Path:          path,
+		DeployKey:     deployKey,
+		WebhookSecret: webhookSecret,
+		NoCaddy:       noCaddy,
 	}
 
 	if err := saveConfig(cfg); err != nil {
@@ -642,17 +874,20 @@ func cmdAdd(args []string) {
 		os.Exit(1)
 	}
 
-	msg := fmt.Sprintf("added %s → %s (%s)", domain, repo, branch)
+	msg := fmt.Sprintf("added %s -> %s (%s)", domain, ownerRepo, branch)
 	if deployKey != "" {
-		msg += fmt.Sprintf(" [dota: %s]", deployKey)
+		msg += fmt.Sprintf(" [key: %s]", deployKey)
+	}
+	if webhookSecret != "" {
+		msg += " [webhook: auto]"
 	}
 	fmt.Println(msg)
 
+	// If deploy key was specified manually but doesn't exist, warn
 	if deployKey != "" {
-		// Verify key exists in dota
 		if _, err := dotaGet(deployKey); err != nil {
 			fmt.Fprintf(os.Stderr, "\nwarn: deploy key %q not found in dota yet\n", deployKey)
-			fmt.Fprintf(os.Stderr, "  store it with: dota set %s \"$(cat ~/.ssh/deploy_key)\"\n", deployKey)
+			fmt.Fprintf(os.Stderr, "  generate with: sites init-key %s\n", domain)
 		}
 	}
 }
@@ -992,6 +1227,13 @@ func cmdInitKey(args []string) {
 		os.Exit(1)
 	}
 	domain := args[0]
+
+	// Security: validate domain
+	if !domainRe.MatchString(domain) {
+		fmt.Fprintf(os.Stderr, "error: invalid domain %q\n", domain)
+		os.Exit(1)
+	}
+
 	keyName := "deploy-key/" + strings.ReplaceAll(domain, ".", "-")
 
 	// Check if key already exists in dota
@@ -1089,6 +1331,15 @@ var (
 	rateLimitMu   sync.Mutex
 	lastDeployAt  = make(map[string]time.Time)
 	rateLimitSecs = 10 // minimum seconds between deploys for same site
+)
+
+// Global concurrency limit: max 5 simultaneous deploys to prevent resource exhaustion
+var deploySemaphore = make(chan struct{}, 5)
+
+// Replay protection: track recent webhook delivery IDs to prevent replay attacks
+var (
+	recentDeliveries   sync.Map // delivery ID -> time.Time
+	deliveryExpiration = 5 * time.Minute
 )
 
 func canDeploy(siteName string) bool {
@@ -1283,6 +1534,16 @@ func cmdWebhook(args []string) {
 			return
 		}
 
+		// Replay protection: check if we've seen this delivery ID
+		deliveryID := r.Header.Get("X-GitHub-Delivery")
+		if deliveryID != "" {
+			if _, seen := recentDeliveries.LoadOrStore(deliveryID, time.Now()); seen {
+				fmt.Fprintf(os.Stderr, "[webhook] %s: replay detected (delivery %s)\n", siteName, deliveryID)
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+		}
+
 		// Check this is for the right branch
 		expectedRef := "refs/heads/" + site.Branch
 		if payload.Ref != expectedRef {
@@ -1300,11 +1561,22 @@ func cmdWebhook(args []string) {
 			return
 		}
 
+		// Global concurrency limit: try to acquire semaphore
+		select {
+		case deploySemaphore <- struct{}{}:
+			// acquired
+		default:
+			fmt.Fprintf(os.Stderr, "[webhook] %s: too many concurrent deploys\n", siteName)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+
 		// Trigger deploy in background
 		fmt.Fprintf(os.Stderr, "[webhook] %s: deploying %s by %s\n",
 			siteName, safeShort(payload.After, 7), payload.Sender.Login)
 
 		go func() {
+			defer func() { <-deploySemaphore }() // release semaphore when done
 			if err := deploySite(cfg, siteName, site); err != nil {
 				fmt.Fprintf(os.Stderr, "[webhook] %s: deploy error: %v\n", siteName, err)
 			} else {
@@ -1322,6 +1594,21 @@ func cmdWebhook(args []string) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+
+	// Start delivery ID cleanup goroutine (prevents memory leak from replay tracking)
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			recentDeliveries.Range(func(key, value any) bool {
+				if ts, ok := value.(time.Time); ok && now.Sub(ts) > deliveryExpiration {
+					recentDeliveries.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
 
 	// Start server
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -1355,7 +1642,7 @@ usage:
   sites init-key <domain>       generate deploy key, store in dota, print pub key
   sites check                   verify all deploy keys exist in dota
 
-  sites add <domain> <repo> [--branch main] [--path subdir] [--deploy-key <dota-secret>] [--private] [--no-caddy]
+  sites add <domain> <repo> [--branch main] [--path subdir] [--deploy-key <dota-secret>] [--no-caddy]
   sites remove <domain>
   sites list
   sites sync
@@ -1366,20 +1653,19 @@ usage:
   sites watch                   poll mode: check every 60s (legacy)
   sites webhook [--port 9111]   webhook mode: HTTP server for GitHub webhooks (recommended)
 
+auto-detection (when gh and dota are available):
+  - Automatically detects public/private repos via GitHub API
+  - Generates and registers deploy keys for private repos
+  - Creates and registers webhooks for instant deploys
+  - Stores all secrets in dota (post-quantum secure)
+
 flags:
-  --deploy-key <name>   dota secret name containing SSH deploy key
-  --private             shorthand: auto-names dota key as deploy-key/<domain>
+  --deploy-key <name>   override: use specific dota secret for SSH deploy key
   --no-caddy            skip Caddyfile entry; use when Caddy is managed externally (e.g. NixOS)
 
-webhook setup:
-  1. generate secret:  openssl rand -hex 32 > /tmp/webhook-secret
-  2. store in dota:    dota set webhook/my-site "$(cat /tmp/webhook-secret)"
-  3. add to config:    webhook_secret = "webhook/my-site"
-  4. configure GitHub: repo → Settings → Webhooks → Add webhook
-     - URL: https://my-site.com/.sites/webhook
-     - Secret: (paste from /tmp/webhook-secret)
-     - Events: Just the push event
-  5. rm /tmp/webhook-secret
+prerequisites for auto-setup:
+  1. gh auth login --scopes repo,admin:public_key
+  2. dota init  (as the caddy user on server)
 
 config: %s (override with SITES_CONFIG env var)
 `, configPath)
