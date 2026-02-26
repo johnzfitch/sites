@@ -34,6 +34,7 @@ type SiteConfig struct {
 	Branch    string `toml:"branch"`
 	Path      string `toml:"path"`       // optional subdirectory to serve
 	DeployKey string `toml:"deploy_key"` // dota secret name for SSH deploy key
+	NoCaddy   bool   `toml:"no_caddy"`   // skip Caddyfile entry; serving managed externally
 }
 
 type Config struct {
@@ -297,6 +298,17 @@ func appendLog(cfg *Config, entry LogEntry) {
 
 // --- Caddyfile generation ---
 
+// hasCaddyManagedSites returns true if any site in cfg generates a Caddyfile entry.
+// When all sites have no_caddy = true, Caddyfile regeneration and caddy reload are skipped.
+func hasCaddyManagedSites(cfg *Config) bool {
+	for _, site := range cfg.Sites {
+		if !site.NoCaddy {
+			return true
+		}
+	}
+	return false
+}
+
 func generateCaddyfile(cfg *Config) string {
 	var b strings.Builder
 	// Note: timestamp is written on actual file write, not here,
@@ -312,6 +324,9 @@ func generateCaddyfile(cfg *Config) string {
 
 	for _, name := range names {
 		site := cfg.Sites[name]
+		if site.NoCaddy {
+			continue // serving managed externally (e.g. NixOS Caddy module)
+		}
 		rootDir := filepath.Join(cfg.Global.Root, name)
 		if site.Path != "" {
 			rootDir = filepath.Join(rootDir, site.Path)
@@ -444,8 +459,8 @@ func reconcile(cfg *Config) {
 		}
 	}
 
-	// Regenerate Caddyfile if anything changed
-	if changed {
+	// Regenerate Caddyfile if anything changed and there are caddy-managed sites
+	if changed && hasCaddyManagedSites(cfg) {
 		newCaddy := generateCaddyfile(cfg)
 		oldCaddy, _ := os.ReadFile(cfg.Global.Caddyfile)
 		if newCaddy != string(oldCaddy) {
@@ -456,7 +471,7 @@ func reconcile(cfg *Config) {
 			}
 			caddyReload()
 		}
-	} else {
+	} else if !changed {
 		fmt.Fprintf(os.Stderr, "  nothing changed\n")
 	}
 }
@@ -507,7 +522,7 @@ func caddyReload() {
 
 func cmdAdd(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: sites add <domain> <repo> [--branch <branch>] [--path <subdir>] [--deploy-key <dota-secret>]\n")
+		fmt.Fprintf(os.Stderr, "usage: sites add <domain> <repo> [--branch <branch>] [--path <subdir>] [--deploy-key <dota-secret>] [--no-caddy]\n")
 		os.Exit(1)
 	}
 	domain := args[0]
@@ -531,6 +546,7 @@ func cmdAdd(args []string) {
 	branch := "main"
 	path := ""
 	deployKey := ""
+	noCaddy := false
 	for i := 2; i < len(args); i++ {
 		switch args[i] {
 		case "--branch":
@@ -551,6 +567,9 @@ func cmdAdd(args []string) {
 		case "--private":
 			// Convenience: auto-generate dota key name from domain
 			deployKey = "deploy-key/" + strings.ReplaceAll(domain, ".", "-")
+		case "--no-caddy":
+			// Don't generate a Caddyfile entry; serving is managed externally
+			noCaddy = true
 		}
 	}
 
@@ -583,6 +602,7 @@ func cmdAdd(args []string) {
 		Branch:    branch,
 		Path:      path,
 		DeployKey: deployKey,
+		NoCaddy:   noCaddy,
 	}
 
 	if err := saveConfig(cfg); err != nil {
@@ -887,7 +907,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, `sites — mutable topology layer for static sites
 
 usage:
-  sites add <domain> <repo> [--branch main] [--path subdir] [--deploy-key <dota-secret>] [--private]
+  sites add <domain> <repo> [--branch main] [--path subdir] [--deploy-key <dota-secret>] [--private] [--no-caddy]
   sites remove <domain>
   sites list
   sites sync
@@ -899,6 +919,7 @@ usage:
 flags:
   --deploy-key <name>   dota secret name containing SSH deploy key
   --private             shorthand: auto-names dota key as deploy-key/<domain>
+  --no-caddy            skip Caddyfile entry; use when Caddy is managed externally (e.g. NixOS)
 
 private repo setup:
   1. ssh-keygen -t ed25519 -f key -N ""
