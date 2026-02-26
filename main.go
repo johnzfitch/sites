@@ -282,11 +282,18 @@ func checkRepoVisibility(repo string) string {
 
 // canAutoSetup checks if gh CLI and dota are available for auto-setup.
 func canAutoSetup() (ghOK, dotaOK bool) {
-	// Check gh CLI with repo scope
-	if out, err := exec.Command("gh", "auth", "status").CombinedOutput(); err == nil {
-		ghOK = strings.Contains(string(out), "Logged in") ||
-			strings.Contains(string(out), "repo") ||
-			strings.Contains(string(out), "admin:public_key")
+	// Check gh CLI: accept GH_TOKEN/GITHUB_TOKEN env vars or stored auth
+	if os.Getenv("GH_TOKEN") != "" || os.Getenv("GITHUB_TOKEN") != "" {
+		// Token in env - verify it actually works with a lightweight API call
+		cmd := exec.Command("gh", "api", "user", "--jq", ".login")
+		if _, err := cmd.Output(); err == nil {
+			ghOK = true
+		}
+	} else {
+		// Fall back to stored credentials check
+		if out, err := exec.Command("gh", "auth", "status").CombinedOutput(); err == nil {
+			ghOK = strings.Contains(string(out), "Logged in")
+		}
 	}
 
 	// Check dota available
@@ -334,11 +341,10 @@ func generateDeployKey(domain string) (pubKey string, secretName string, err err
 		return "", "", fmt.Errorf("read pubkey: %w", err)
 	}
 
-	// Store in dota
-	cmd = exec.Command("dota", "set", secretName)
-	cmd.Stdin = strings.NewReader(string(privKey))
-	if err := cmd.Run(); err != nil {
-		return "", "", fmt.Errorf("dota set: %w", err)
+	// Store in dota (pass value as positional arg; dota reads from /dev/tty otherwise)
+	cmd = exec.Command("dota", "set", secretName, string(privKey))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("dota set: %w: %s", err, string(out))
 	}
 
 	return strings.TrimSpace(string(pubKeyBytes)), secretName, nil
@@ -374,11 +380,10 @@ func generateWebhookSecret(domain string) (secret string, secretName string, err
 	rand.Read(buf[:])
 	secret = hex.EncodeToString(buf[:])
 
-	// Store in dota
-	cmd := exec.Command("dota", "set", secretName)
-	cmd.Stdin = strings.NewReader(secret)
-	if err := cmd.Run(); err != nil {
-		return "", "", fmt.Errorf("dota set: %w", err)
+	// Store in dota (pass value as positional arg; dota reads from /dev/tty otherwise)
+	cmd := exec.Command("dota", "set", secretName, secret)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("dota set: %w: %s", err, string(out))
 	}
 
 	return secret, secretName, nil
