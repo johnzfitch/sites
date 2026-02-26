@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,6 +18,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -23,18 +29,20 @@ import (
 // --- Config types ---
 
 type GlobalConfig struct {
-	Root      string `toml:"root"`
-	Caddyfile string `toml:"caddyfile"`
-	Log       string `toml:"log"`
+	Root        string `toml:"root"`
+	Caddyfile   string `toml:"caddyfile"`
+	Log         string `toml:"log"`
+	WebhookPort int    `toml:"webhook_port"` // port for webhook server (default: 9111)
 }
 
 type SiteConfig struct {
-	Domain    string `toml:"domain"`
-	Repo      string `toml:"repo"`
-	Branch    string `toml:"branch"`
-	Path      string `toml:"path"`       // optional subdirectory to serve
-	DeployKey string `toml:"deploy_key"` // dota secret name for SSH deploy key
-	NoCaddy   bool   `toml:"no_caddy"`   // skip Caddyfile entry; serving managed externally
+	Domain        string `toml:"domain"`
+	Repo          string `toml:"repo"`
+	Branch        string `toml:"branch"`
+	Path          string `toml:"path"`           // optional subdirectory to serve
+	DeployKey     string `toml:"deploy_key"`     // dota secret name for SSH deploy key
+	WebhookSecret string `toml:"webhook_secret"` // dota secret name for GitHub webhook HMAC
+	NoCaddy       bool   `toml:"no_caddy"`       // skip Caddyfile entry; serving managed externally
 }
 
 type Config struct {
@@ -136,6 +144,30 @@ func tmpfsKeyDir() string {
 		}
 	}
 	return filepath.Join(os.TempDir(), "sites-keys")
+}
+
+// getSecret retrieves a secret by name. Supports:
+//   - "file:/path/to/secret" - read from file (for NixOS agenix secrets)
+//   - "env:VAR_NAME" - read from environment variable
+//   - "secretname" - read from dota vault
+func getSecret(secretRef string) (string, error) {
+	if strings.HasPrefix(secretRef, "file:") {
+		path := strings.TrimPrefix(secretRef, "file:")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read secret file %s: %w", path, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	if strings.HasPrefix(secretRef, "env:") {
+		varName := strings.TrimPrefix(secretRef, "env:")
+		val := os.Getenv(varName)
+		if val == "" {
+			return "", fmt.Errorf("env var %s not set", varName)
+		}
+		return val, nil
+	}
+	return dotaGet(secretRef)
 }
 
 func dotaGet(secretName string) (string, error) {
@@ -1050,6 +1082,268 @@ func cmdCheck() {
 	fmt.Printf("\nall deploy keys present\n")
 }
 
+// --- Webhook server ---
+
+// Rate limiting: track last deploy time per site to prevent DoS
+var (
+	rateLimitMu   sync.Mutex
+	lastDeployAt  = make(map[string]time.Time)
+	rateLimitSecs = 10 // minimum seconds between deploys for same site
+)
+
+func canDeploy(siteName string) bool {
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+	last, ok := lastDeployAt[siteName]
+	if !ok || time.Since(last) > time.Duration(rateLimitSecs)*time.Second {
+		lastDeployAt[siteName] = time.Now()
+		return true
+	}
+	return false
+}
+
+// GitHubWebhookPayload represents the relevant fields from GitHub push webhook
+type GitHubWebhookPayload struct {
+	Ref        string `json:"ref"`        // e.g. "refs/heads/main"
+	Repository struct {
+		FullName string `json:"full_name"` // e.g. "johnzfitch/definitelynot.ai"
+		CloneURL string `json:"clone_url"` // e.g. "https://github.com/..."
+		SSHURL   string `json:"ssh_url"`   // e.g. "git@github.com:..."
+	} `json:"repository"`
+	After  string `json:"after"`  // commit SHA after push
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+}
+
+// verifyGitHubSignature validates the X-Hub-Signature-256 header using HMAC-SHA256.
+// Uses constant-time comparison to prevent timing attacks.
+func verifyGitHubSignature(body []byte, signature, secret string) bool {
+	if !strings.HasPrefix(signature, "sha256=") {
+		return false
+	}
+	sigBytes, err := hex.DecodeString(strings.TrimPrefix(signature, "sha256="))
+	if err != nil {
+		return false
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := mac.Sum(nil)
+
+	return subtle.ConstantTimeCompare(sigBytes, expected) == 1
+}
+
+// findSiteByRepo finds a site config by matching the repository URL.
+// Returns site name and config, or empty string and nil if not found.
+func findSiteByRepo(cfg *Config, repoFullName string) (string, *SiteConfig) {
+	// repoFullName is like "johnzfitch/definitelynot.ai"
+	for name, site := range cfg.Sites {
+		// Normalize site repo for comparison
+		siteRepo := site.Repo
+		siteRepo = strings.TrimPrefix(siteRepo, "https://github.com/")
+		siteRepo = strings.TrimPrefix(siteRepo, "git@github.com:")
+		siteRepo = strings.TrimSuffix(siteRepo, ".git")
+
+		if siteRepo == repoFullName {
+			return name, site
+		}
+	}
+	return "", nil
+}
+
+// deploySite performs a deploy for a single site (used by webhook handler)
+func deploySite(cfg *Config, name string, site *SiteConfig) error {
+	repoDir := filepath.Join(cfg.Global.Root, name)
+	repo := effectiveRepo(site)
+	start := time.Now()
+
+	var deployErr error
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
+		// Clone
+		if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
+			deployErr = err
+		} else {
+			deployErr = withDeployKey(site.DeployKey, func(env []string) error {
+				return gitCloneWithEnv(repo, site.Branch, repoDir, env)
+			})
+		}
+	} else {
+		// Pull
+		deployErr = withDeployKey(site.DeployKey, func(env []string) error {
+			return gitPullWithEnv(repoDir, site.Branch, env)
+		})
+	}
+
+	commit := gitHead(repoDir)
+	action := "webhook-deploy"
+	errStr := ""
+	if deployErr != nil {
+		action = "webhook-error"
+		errStr = deployErr.Error()
+	}
+
+	appendLog(cfg, LogEntry{
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Domain:    site.Domain,
+		Action:    action,
+		Commit:    commit,
+		DurMs:     time.Since(start).Milliseconds(),
+		Error:     errStr,
+	})
+
+	return deployErr
+}
+
+func cmdWebhook(args []string) {
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	port := cfg.Global.WebhookPort
+	if port == 0 {
+		port = 9111
+	}
+
+	// Parse optional port override
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--port" && i+1 < len(args) {
+			fmt.Sscanf(args[i+1], "%d", &port)
+		}
+	}
+
+	// Load webhook secrets into memory at startup
+	// Supports: dota secrets, file:/path, env:VAR_NAME
+	// Map: site name → secret
+	secrets := make(map[string]string)
+	for name, site := range cfg.Sites {
+		if site.WebhookSecret == "" {
+			continue
+		}
+		secret, err := getSecret(site.WebhookSecret)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: could not load webhook secret for %s: %v\n", name, err)
+			continue
+		}
+		secrets[name] = secret
+	}
+
+	if len(secrets) == 0 {
+		fmt.Fprintf(os.Stderr, "error: no sites have webhook_secret configured\n")
+		fmt.Fprintf(os.Stderr, "  add webhook_secret to sites.toml and store secret in dota\n")
+		os.Exit(1)
+	}
+
+	// Webhook handler
+	http.HandleFunc("/.sites/webhook", func(w http.ResponseWriter, r *http.Request) {
+		// Only accept POST
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Read body (limit to 1MB to prevent memory exhaustion)
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Parse payload to find which repo this is for
+		var payload GitHubWebhookPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Find matching site
+		siteName, site := findSiteByRepo(cfg, payload.Repository.FullName)
+		if siteName == "" {
+			// No matching site - could be misconfigured webhook
+			fmt.Fprintf(os.Stderr, "[webhook] unknown repo: %s\n", payload.Repository.FullName)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		// Get secret for this site
+		secret, ok := secrets[siteName]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "[webhook] no secret configured for %s\n", siteName)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		// Verify HMAC signature
+		signature := r.Header.Get("X-Hub-Signature-256")
+		if !verifyGitHubSignature(body, signature, secret) {
+			fmt.Fprintf(os.Stderr, "[webhook] invalid signature for %s\n", siteName)
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		// Check this is for the right branch
+		expectedRef := "refs/heads/" + site.Branch
+		if payload.Ref != expectedRef {
+			fmt.Fprintf(os.Stderr, "[webhook] %s: ignoring push to %s (want %s)\n",
+				siteName, payload.Ref, expectedRef)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ignored: wrong branch"))
+			return
+		}
+
+		// Rate limit check
+		if !canDeploy(siteName) {
+			fmt.Fprintf(os.Stderr, "[webhook] %s: rate limited\n", siteName)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+
+		// Trigger deploy in background
+		fmt.Fprintf(os.Stderr, "[webhook] %s: deploying %s by %s\n",
+			siteName, safeShort(payload.After, 7), payload.Sender.Login)
+
+		go func() {
+			if err := deploySite(cfg, siteName, site); err != nil {
+				fmt.Fprintf(os.Stderr, "[webhook] %s: deploy error: %v\n", siteName, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[webhook] %s: deployed @ %s\n",
+					siteName, gitHead(filepath.Join(cfg.Global.Root, siteName)))
+			}
+		}()
+
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("deploying"))
+	})
+
+	// Health endpoint
+	http.HandleFunc("/.sites/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	// Start server
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Fprintf(os.Stderr, "sitesd: webhook server listening on %s\n", addr)
+	fmt.Fprintf(os.Stderr, "  configured sites: %d with webhooks\n", len(secrets))
+
+	// Handle shutdown
+	srv := &http.Server{Addr: addr}
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		fmt.Fprintf(os.Stderr, "\nsitesd: shutting down webhook server\n")
+		srv.Close()
+	}()
+
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // --- Main ---
 
 func main() {
@@ -1068,19 +1362,24 @@ usage:
   sites deploy <domain>
   sites log [domain]
   sites caddy
-  sites watch
+
+  sites watch                   poll mode: check every 60s (legacy)
+  sites webhook [--port 9111]   webhook mode: HTTP server for GitHub webhooks (recommended)
 
 flags:
   --deploy-key <name>   dota secret name containing SSH deploy key
   --private             shorthand: auto-names dota key as deploy-key/<domain>
   --no-caddy            skip Caddyfile entry; use when Caddy is managed externally (e.g. NixOS)
 
-private repo setup:
-  1. sites init                          # bootstrap server
-  2. sites init-key my-site.com          # generates key, prints pubkey
-  3. add pubkey to GitHub repo → Settings → Deploy keys
-  4. sites add my-site.com user/repo --private
-  5. sites sync
+webhook setup:
+  1. generate secret:  openssl rand -hex 32 > /tmp/webhook-secret
+  2. store in dota:    dota set webhook/my-site "$(cat /tmp/webhook-secret)"
+  3. add to config:    webhook_secret = "webhook/my-site"
+  4. configure GitHub: repo → Settings → Webhooks → Add webhook
+     - URL: https://my-site.com/.sites/webhook
+     - Secret: (paste from /tmp/webhook-secret)
+     - Events: Just the push event
+  5. rm /tmp/webhook-secret
 
 config: %s (override with SITES_CONFIG env var)
 `, configPath)
@@ -1113,6 +1412,8 @@ config: %s (override with SITES_CONFIG env var)
 		cmdCaddy()
 	case "watch":
 		cmdWatch()
+	case "webhook":
+		cmdWebhook(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		os.Exit(1)
