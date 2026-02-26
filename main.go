@@ -341,8 +341,8 @@ func generateDeployKey(domain string) (pubKey string, secretName string, err err
 		return "", "", fmt.Errorf("read pubkey: %w", err)
 	}
 
-	// Store in dota (pass value as positional arg; dota reads from /dev/tty otherwise)
-	cmd = exec.Command("dota", "set", secretName, string(privKey))
+	// Store in dota; use -- to prevent PEM header being parsed as a flag
+	cmd = exec.Command("dota", "set", secretName, "--", string(privKey))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", "", fmt.Errorf("dota set: %w: %s", err, string(out))
 	}
