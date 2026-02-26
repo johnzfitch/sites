@@ -900,6 +900,156 @@ func timeAgo(t time.Time) string {
 	}
 }
 
+// --- Bootstrap commands ---
+
+func cmdInit() {
+	// Load or create default config
+	cfg, err := loadConfig()
+	if err != nil {
+		cfg = &Config{
+			Global: GlobalConfig{
+				Root:      "/var/lib/sites",
+				Caddyfile: "/etc/caddy/sites.conf",
+			},
+			Sites: make(map[string]*SiteConfig),
+		}
+	}
+
+	// Create directories
+	dirs := []string{
+		cfg.Global.Root,
+		filepath.Dir(cfg.Global.Caddyfile),
+		filepath.Dir(configPath),
+		tmpfsKeyDir(),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: mkdir %s: %v\n", d, err)
+		} else {
+			fmt.Printf("  ✓ %s\n", d)
+		}
+	}
+
+	// Save config if it doesn't exist
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		if err := saveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "error: save config: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ %s (created)\n", configPath)
+	} else {
+		fmt.Printf("  ✓ %s (exists)\n", configPath)
+	}
+
+	// Check dota availability
+	if _, err := exec.LookPath("dota"); err != nil {
+		fmt.Fprintf(os.Stderr, "\nwarn: dota not found in PATH\n")
+		fmt.Fprintf(os.Stderr, "  private repos require dota for deploy key management\n")
+	} else {
+		fmt.Printf("  ✓ dota available\n")
+	}
+
+	fmt.Printf("\nsites initialized. add sites with:\n")
+	fmt.Printf("  sites add example.com user/repo\n")
+}
+
+func cmdInitKey(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: sites init-key <domain>\n")
+		fmt.Fprintf(os.Stderr, "\ngenerates an ed25519 deploy key, stores in dota, prints public key\n")
+		os.Exit(1)
+	}
+	domain := args[0]
+	keyName := "deploy-key/" + strings.ReplaceAll(domain, ".", "-")
+
+	// Check if key already exists in dota
+	if _, err := dotaGet(keyName); err == nil {
+		fmt.Fprintf(os.Stderr, "error: key %q already exists in dota\n", keyName)
+		fmt.Fprintf(os.Stderr, "  to regenerate: dota rm %s && sites init-key %s\n", keyName, domain)
+		os.Exit(1)
+	}
+
+	// Generate ed25519 key pair to tmpfs
+	kd := tmpfsKeyDir()
+	if err := os.MkdirAll(kd, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "error: mkdir: %v\n", err)
+		os.Exit(1)
+	}
+	var rndBytes [8]byte
+	rand.Read(rndBytes[:])
+	keyPath := filepath.Join(kd, hex.EncodeToString(rndBytes[:]))
+	defer os.Remove(keyPath)
+	defer os.Remove(keyPath + ".pub")
+
+	// Generate key with ssh-keygen
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-f", keyPath, "-N", "", "-C", "sites-deploy-"+domain)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: ssh-keygen: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Read private key
+	privKey, err := os.ReadFile(keyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: read key: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Read public key
+	pubKey, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: read pubkey: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Store private key in dota
+	cmd = exec.Command("dota", "set", keyName, string(privKey))
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: dota set: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  make sure dota is initialized: dota init\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("deploy key generated and stored in dota as: %s\n\n", keyName)
+	fmt.Printf("add this public key to GitHub → repo → Settings → Deploy keys:\n\n")
+	fmt.Printf("  %s\n", strings.TrimSpace(string(pubKey)))
+	fmt.Printf("\nthen run:\n")
+	fmt.Printf("  sites add %s user/repo --private\n", domain)
+}
+
+func cmdCheck() {
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	ok := true
+	for name, site := range cfg.Sites {
+		if site.DeployKey == "" {
+			fmt.Printf("  ✓ %s (public)\n", name)
+			continue
+		}
+		if _, err := dotaGet(site.DeployKey); err != nil {
+			fmt.Printf("  ✗ %s: missing dota key %q\n", name, site.DeployKey)
+			ok = false
+		} else {
+			fmt.Printf("  ✓ %s (dota: %s)\n", name, site.DeployKey)
+		}
+	}
+
+	if !ok {
+		fmt.Fprintf(os.Stderr, "\nsome deploy keys are missing. generate with:\n")
+		fmt.Fprintf(os.Stderr, "  sites init-key <domain>\n")
+		os.Exit(1)
+	}
+	fmt.Printf("\nall deploy keys present\n")
+}
+
 // --- Main ---
 
 func main() {
@@ -907,6 +1057,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, `sites — mutable topology layer for static sites
 
 usage:
+  sites init                    bootstrap directories and config
+  sites init-key <domain>       generate deploy key, store in dota, print pub key
+  sites check                   verify all deploy keys exist in dota
+
   sites add <domain> <repo> [--branch main] [--path subdir] [--deploy-key <dota-secret>] [--private] [--no-caddy]
   sites remove <domain>
   sites list
@@ -922,10 +1076,11 @@ flags:
   --no-caddy            skip Caddyfile entry; use when Caddy is managed externally (e.g. NixOS)
 
 private repo setup:
-  1. ssh-keygen -t ed25519 -f key -N ""
-  2. add key.pub to GitHub repo → Settings → Deploy keys
-  3. dota set deploy-key/my-site "$(cat key)"
+  1. sites init                          # bootstrap server
+  2. sites init-key my-site.com          # generates key, prints pubkey
+  3. add pubkey to GitHub repo → Settings → Deploy keys
   4. sites add my-site.com user/repo --private
+  5. sites sync
 
 config: %s (override with SITES_CONFIG env var)
 `, configPath)
@@ -936,6 +1091,12 @@ config: %s (override with SITES_CONFIG env var)
 	args := os.Args[2:]
 
 	switch cmd {
+	case "init":
+		cmdInit()
+	case "init-key":
+		cmdInitKey(args)
+	case "check":
+		cmdCheck()
 	case "add":
 		cmdAdd(args)
 	case "remove", "rm":
