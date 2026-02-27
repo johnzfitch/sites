@@ -1284,8 +1284,8 @@ func cmdInitKey(args []string) {
 		os.Exit(1)
 	}
 
-	// Store private key in dota (pipe via stdin to avoid process-visible secrets
-	// and values starting with dashes being parsed as flags)
+	// Store private key in dota. Pipe via stdin to avoid process-visible secrets
+	// and values starting with dashes being parsed as flags.
 	cmd = exec.Command("dota", "set", keyName)
 	cmd.Stdin = strings.NewReader(string(privKey))
 	cmd.Stdout = os.Stderr
