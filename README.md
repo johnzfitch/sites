@@ -21,9 +21,9 @@ Your NixOS config defines *what the server is*&hairsp;&mdash;&hairsp;Caddy, syst
 
 ```
 ┌──────────────┐     ┌──────────┐     ┌───────────┐
-│   GitHub     │────▶│  sites   │────▶│   Caddy   │
-│   (repos)    │     │(reconcile│     │  (serve)   │
-│              │     │  + emit) │     │            │
+│   GitHub     │───▶│  sites   │───▶|   Caddy   │
+│   (repos)    │     │(reconcile│     │  (serve)  │
+│              │     │  + emit) │     │           │
 └──────────────┘     └──────────┘     └───────────┘
                           │
                      sites.toml
