@@ -341,8 +341,9 @@ func generateDeployKey(domain string) (pubKey string, secretName string, err err
 		return "", "", fmt.Errorf("read pubkey: %w", err)
 	}
 
-	// Store in dota; use -- to prevent PEM header being parsed as a flag
-	cmd = exec.Command("dota", "set", secretName, "--", string(privKey))
+	// Store in dota; pipe via stdin to avoid process-visible secrets
+	cmd = exec.Command("dota", "set", secretName)
+	cmd.Stdin = strings.NewReader(string(privKey))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", "", fmt.Errorf("dota set: %w: %s", err, string(out))
 	}
@@ -1283,8 +1284,10 @@ func cmdInitKey(args []string) {
 		os.Exit(1)
 	}
 
-	// Store private key in dota
-	cmd = exec.Command("dota", "set", keyName, string(privKey))
+	// Store private key in dota. Pipe via stdin to avoid process-visible secrets
+	// and values starting with dashes being parsed as flags.
+	cmd = exec.Command("dota", "set", keyName)
+	cmd.Stdin = strings.NewReader(string(privKey))
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
